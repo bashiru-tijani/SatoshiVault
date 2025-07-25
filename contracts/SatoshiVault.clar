@@ -79,3 +79,83 @@
     (ok (var-set contract-owner new-owner))
   )
 )
+
+;; Adjust annual reward rate (owner only)
+(define-public (set-reward-rate (new-rate uint))
+  (begin
+    (asserts! (is-eq tx-sender (var-get contract-owner)) ERR_NOT_AUTHORIZED)
+    (asserts! (< new-rate u10000) ERR_INVALID_REWARD_RATE) ;; Maximum 100% APY
+    (ok (var-set reward-rate new-rate))
+  )
+)
+
+;; Modify minimum staking duration (owner only)
+(define-public (set-min-stake-period (new-period uint))
+  (begin
+    (asserts! (is-eq tx-sender (var-get contract-owner)) ERR_NOT_AUTHORIZED)
+    (asserts! (> new-period u0) ERR_INVALID_PERIOD)
+    (ok (var-set min-stake-period new-period))
+  )
+)
+
+;; Deposit sBTC into reward distribution pool
+(define-public (add-to-reward-pool (amount uint))
+  (begin
+    (asserts! (> amount u0) ERR_ZERO_STAKE)
+    ;; Transfer sBTC from sender to contract custody
+    (try! (contract-call? 'ST1F7QA2MDF17S807EPA36TSS8AMEFY4KA9TVGWXT.sbtc-token
+      transfer amount tx-sender (as-contract tx-sender) none
+    ))
+    ;; Increment available reward pool
+    (var-set reward-pool (+ (var-get reward-pool) amount))
+    (ok true)
+  )
+)
+
+;; CORE STAKING MECHANICS
+
+;; Lock sBTC tokens to begin earning yield
+(define-public (stake (amount uint))
+  (begin
+    (asserts! (> amount u0) ERR_ZERO_STAKE)
+    ;; Custody sBTC in protocol vault
+    (try! (contract-call? 'ST1F7QA2MDF17S807EPA36TSS8AMEFY4KA9TVGWXT.sbtc-token
+      transfer amount tx-sender (as-contract tx-sender) none
+    ))
+    ;; Create or update staking position
+    (match (map-get? stakes { staker: tx-sender })
+      prev-stake
+      ;; Compound with existing stake
+      (map-set stakes { staker: tx-sender } {
+        amount: (+ amount (get amount prev-stake)),
+        staked-at: stacks-block-height,
+      })
+      ;; Initialize new staking position
+      (map-set stakes { staker: tx-sender } {
+        amount: amount,
+        staked-at: stacks-block-height,
+      })
+    )
+    ;; Update protocol total value locked
+    (var-set total-staked (+ (var-get total-staked) amount))
+    (ok true)
+  )
+)
+
+;; Calculate accrued rewards for staker based on time and rate
+(define-read-only (calculate-rewards (staker principal))
+  (match (map-get? stakes { staker: staker })
+    stake-info
+    (let (
+        (stake-amount (get amount stake-info))
+        (stake-duration (- stacks-block-height (get staked-at stake-info)))
+        (annual-reward-basis (/ (* stake-amount (var-get reward-rate)) u10000))
+        (blocks-per-year u52560) ;; Approximately 365 days on Stacks mainnet
+        (time-factor (/ (* stake-duration u10000) blocks-per-year))
+        (earned-reward (* annual-reward-basis (/ time-factor u10000)))
+      )
+      earned-reward
+    )
+    u0 ;; No active stake found
+  )
+)
