@@ -159,3 +159,65 @@
     u0 ;; No active stake found
   )
 )
+
+;; Harvest accrued rewards while maintaining staking position
+(define-public (claim-rewards)
+  (let (
+      (stake-info (unwrap! (map-get? stakes { staker: tx-sender }) ERR_NO_STAKE_FOUND))
+      (reward-amount (calculate-rewards tx-sender))
+    )
+    (asserts! (> reward-amount u0) ERR_NO_STAKE_FOUND)
+    (asserts! (<= reward-amount (var-get reward-pool)) ERR_NOT_ENOUGH_REWARDS)
+    ;; Decrease available reward pool
+    (var-set reward-pool (- (var-get reward-pool) reward-amount))
+    ;; Track cumulative rewards claimed
+    (match (map-get? rewards-claimed { staker: tx-sender })
+      prev-claimed (map-set rewards-claimed { staker: tx-sender } { amount: (+ reward-amount (get amount prev-claimed)) })
+      (map-set rewards-claimed { staker: tx-sender } { amount: reward-amount })
+    )
+    ;; Reset reward calculation timer
+    (map-set stakes { staker: tx-sender } {
+      amount: (get amount stake-info),
+      staked-at: stacks-block-height,
+    })
+    ;; Distribute rewards to staker
+    (as-contract (try! (contract-call? 'ST1F7QA2MDF17S807EPA36TSS8AMEFY4KA9TVGWXT.sbtc-token
+      transfer reward-amount (as-contract tx-sender) tx-sender none
+    )))
+    (ok true)
+  )
+)
+
+;; Withdraw staked sBTC after minimum lock period with automatic reward claim
+(define-public (unstake (amount uint))
+  (let (
+      (stake-info (unwrap! (map-get? stakes { staker: tx-sender }) ERR_NO_STAKE_FOUND))
+      (staked-amount (get amount stake-info))
+      (staked-at (get staked-at stake-info))
+      (stake-duration (- stacks-block-height staked-at))
+    )
+    ;; Validate withdrawal requirements
+    (asserts! (> amount u0) ERR_ZERO_STAKE)
+    (asserts! (>= staked-amount amount) ERR_NO_STAKE_FOUND)
+    (asserts! (>= stake-duration (var-get min-stake-period))
+      ERR_TOO_EARLY_TO_UNSTAKE
+    )
+    ;; Auto-harvest pending rewards before withdrawal
+    (try! (claim-rewards))
+    ;; Update or close staking position
+    (if (> staked-amount amount)
+      (map-set stakes { staker: tx-sender } {
+        amount: (- staked-amount amount),
+        staked-at: stacks-block-height,
+      })
+      (map-delete stakes { staker: tx-sender })
+    )
+    ;; Decrease total value locked
+    (var-set total-staked (- (var-get total-staked) amount))
+    ;; Return sBTC to user wallet
+    (as-contract (try! (contract-call? 'ST1F7QA2MDF17S807EPA36TSS8AMEFY4KA9TVGWXT.sbtc-token
+      transfer amount (as-contract tx-sender) tx-sender none
+    )))
+    (ok true)
+  )
+)
